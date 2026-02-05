@@ -9,6 +9,7 @@ import warnings
 from datetime import datetime, timedelta
 import io
 import requests
+import gc # 引入垃圾回收機制，強制釋放記憶體
 
 # 忽略 pandas 的 FutureWarning
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -18,17 +19,16 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 # ==========================================
 SHEET_NAME = 'AStock Overnight trading'
 
-# ⚠️⚠️⚠️ 記憶體安全開關 ⚠️⚠️⚠️
-# True = 只跑 S&P 500 前 100 大權重股 (建議！雲端免費版才跑得動)
-# False = 跑完整 500 檔 (極可能導致 Streamlit Cloud 記憶體不足崩潰)
-LIMIT_TOP_100 = True 
+# ✅ 分批處理設定 (關鍵優化)
+# 每次只處理 50 檔股票，處理完立刻釋放記憶體
+BATCH_SIZE = 50 
 
 # 設定回測時間
 BACKTEST_PERIOD = "5y" 
 
 CONFIG = {
     'MIN_PRICE': 2.0, 
-    'MAX_PRICE': 500.0, # 放寬價格上限以包含大型股
+    'MAX_PRICE': 1000.0, # 配合大型股放寬
     'MIN_VOLUME': 800000,
     'MARKET_FILTER_MA': 50, 
     'MARKET_FILTER': True,
@@ -45,39 +45,24 @@ CONFIG = {
     'HOLDING_DAYS': 5
 }
 
-# 預設備用清單 (萬一抓不到 SP500 時使用)
-FALLBACK_TICKERS = [
-    'AAPL', 'NVDA', 'MSFT', 'AMZN', 'GOOGL', 'META', 'TSLA', 'BRK-B', 'LLY', 'AVGO', 
-    'V', 'JPM', 'XOM', 'WMT', 'UNH', 'MA', 'PG', 'COST', 'JNJ', 'HD', 'MRK', 'ORCL', 
-    'CVX', 'ABBV', 'BAC', 'CRM', 'KO', 'NFLX', 'AMD', 'PEP', 'TMO', 'LIN', 'WFC', 
-    'ADBE', 'DIS', 'MCD', 'CSCO', 'ACN', 'ABT', 'QCOM', 'CAT', 'INTU', 'GE', 'AMAT', 
-    'TXN', 'DHR', 'VZ', 'IBM', 'PM', 'AMGN', 'NOW', 'ISRG', 'UBER', 'PFE', 'GS'
-]
+# 備用清單
+FALLBACK_TICKERS = ['AAPL', 'NVDA', 'MSFT', 'AMZN', 'GOOGL', 'META', 'TSLA']
 
 # ==========================================
-# 1. 取得 S&P 500 成分股 (改用 CSV 以避免依賴問題)
+# 1. 取得 S&P 500 成分股
 # ==========================================
 @st.cache_data(ttl=3600*24)
 def get_sp500_tickers():
     try:
-        # 使用 Slickcharts 或 GitHub 的公開 CSV 來源 (這裡使用 GitHub 上的可靠來源)
         url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv"
         response = requests.get(url)
         if response.status_code == 200:
             df = pd.read_csv(io.StringIO(response.text))
             tickers = df['Symbol'].tolist()
-            # 確保格式正確 (例如 BRK.B -> BRK-B)
             clean_tickers = [t.replace('.', '-') for t in tickers]
-            
-            if LIMIT_TOP_100:
-                return clean_tickers[:100] # 只回傳前 100 檔
             return clean_tickers
-        else:
-            st.warning("⚠️ 無法下載 S&P 500 清單，使用備用清單。")
-            return FALLBACK_TICKERS
-    except Exception as e:
-        st.error(f"⚠️ 下載成分股清單失敗: {e}，使用備用清單。")
         return FALLBACK_TICKERS
+    except: return FALLBACK_TICKERS
 
 # ==========================================
 # 2. Google Sheet 連線
@@ -86,7 +71,7 @@ def connect_to_gsheet():
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         if "gcp_service_account" not in st.secrets:
-            st.error("❌ 未偵測到 Secrets，無法連線 Sheet。")
+            st.error("❌ 未偵測到 Secrets。")
             return None
         key_dict = dict(st.secrets["gcp_service_account"])
         creds = ServiceAccountCredentials.from_json_keyfile_dict(key_dict, scope)
@@ -110,49 +95,20 @@ def upload_dataframe(sheet, tab_name, df):
     except Exception as e: st.error(f"❌ 上傳失敗: {e}")
 
 # ==========================================
-# 3. 數據獲取 (批次處理以節省記憶體)
+# 3. 策略核心邏輯 (單一批次運算)
 # ==========================================
-@st.cache_data(ttl=3600*4)
-def get_data(tickers):
-    with st.spinner(f'📥 正在下載 {len(tickers)} 檔股票的 {BACKTEST_PERIOD} 數據...'):
-        # 1. 下載 SPY
-        spy = yf.download("SPY", period=BACKTEST_PERIOD, progress=False, auto_adjust=False)
-        if isinstance(spy.columns, pd.MultiIndex): spy.columns = spy.columns.get_level_values(0)
-        
-        # 2. 下載個股
-        # 使用 threads=True 加速，但這也是記憶體殺手
-        data = yf.download(tickers, period=BACKTEST_PERIOD, group_by='ticker', auto_adjust=False, threads=True)
-        
-        if not data.empty:
-             data = data.dropna(axis=1, how='all')
-        
-        return data, spy
-
-# ==========================================
-# 4. 策略邏輯
-# ==========================================
-def run_strategy(data, spy):
-    status_text = st.empty()
-    status_text.text("🧠 執行 V60 策略運算中 (這可能需要一點時間)...")
-    
-    spy_ma = spy['Close'].rolling(CONFIG['MARKET_FILTER_MA']).mean()
-    market_signal = (spy['Close'] > spy_ma).to_dict()
-
+def process_batch_strategy(data, spy, market_signal):
+    """處理單一批次的股票數據"""
+    batch_candidates = []
     tickers = data.columns.levels[0].tolist()
-    all_candidates = []
 
-    progress_bar = st.progress(0)
-    
-    for i, ticker in enumerate(tickers):
-        # 每 10 檔更新一次進度條，減少前端負擔
-        if i % 10 == 0: progress_bar.progress((i + 1) / len(tickers))
-        
+    for ticker in tickers:
         try:
             df = data[ticker].copy().dropna()
             if len(df) < 60: continue 
             if df.index.tz is not None: df.index = df.index.tz_localize(None)
 
-            # 指標計算
+            # --- 技術指標 ---
             df['MA60'] = df['Close'].rolling(60).mean()
             df['VolMA20'] = df['Volume'].rolling(20).mean().replace(0, 1)
             df['RVol'] = df['Volume'] / df['VolMA20']
@@ -170,7 +126,7 @@ def run_strategy(data, spy):
             df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
             df['Weekday'] = df.index.dayofweek
 
-            # 篩選條件
+            # --- 篩選條件 ---
             condition = (
                 (df['Weekday'] == 0) & 
                 (df['Close'] >= CONFIG['MIN_PRICE']) & (df['Close'] <= CONFIG['MAX_PRICE']) & 
@@ -190,13 +146,14 @@ def run_strategy(data, spy):
                 if not market_signal.get(date, False): continue
                 loc = df.index.get_loc(date)
                 monday_open = df.iloc[loc]
+                
+                # 交易參數
                 buy_date = monday_open.name
                 buy_price = float(monday_open['Open'])
                 stop_price = buy_price * (1 + CONFIG['STOP_LOSS_PCT'])
-                
                 sell_date, sell_price, status = None, 0.0, ""
                 
-                # A. 歷史交易
+                # A. 歷史回測
                 if loc + 5 < len(df):
                     week_data = df.iloc[loc:loc+5]
                     hit_stop = week_data['Low'] <= stop_price
@@ -204,11 +161,8 @@ def run_strategy(data, spy):
                         status, sell_price = "StopLoss", stop_price
                         sell_date = week_data[hit_stop].index[0]
                     else:
-                        status = "Closed"
-                        next_monday = df.iloc[loc+5]
-                        sell_date = next_monday.name
-                        sell_price = float(next_monday['Open'])
-                
+                        status, sell_price = "Closed", float(df.iloc[loc+5]['Open'])
+                        sell_date = df.iloc[loc+5].name
                 # B. 持倉中
                 else:
                     days_passed = df.iloc[loc:]
@@ -223,7 +177,7 @@ def run_strategy(data, spy):
                 pnl = sell_price - buy_price
                 ret_pct = pnl / buy_price
 
-                all_candidates.append({
+                batch_candidates.append({
                     'Ticker': ticker, 'Buy_Date': buy_date, 'Buy_Price': round(buy_price, 2),
                     'Sell_Date': sell_date, 'Sell_Price': round(sell_price, 2),
                     'Profit': round(pnl, 2), 'Return_Pct': round(ret_pct * 100, 2),
@@ -231,62 +185,67 @@ def run_strategy(data, spy):
                 })
 
         except Exception: continue
-    
-    status_text.empty()
-    progress_bar.empty()
         
-    if not all_candidates: return pd.DataFrame()
-    
-    df_all = pd.DataFrame(all_candidates)
-    df_history = df_all.sort_values(by=['Buy_Date', 'RVol'], ascending=[True, False]) \
-                        .groupby('Buy_Date').head(CONFIG['HOLDING_COUNT']).reset_index(drop=True)
-    
-    return df_history.sort_values(by='Buy_Date', ascending=False)
+    return batch_candidates
 
-def predict_next_week(data, spy):
+# ==========================================
+# 4. 下週預測 (使用最後一批資料或重新下載)
+# ==========================================
+def predict_next_week(tickers, spy):
+    # 為了節省時間，這裡只針對 SPY 狀態良好的情況下，快速掃描所有股票的"最新狀態"
+    # 下載 "3mo" (3個月) 的數據就夠判斷最新訊號了，速度快很多
     candidates = []
-    tickers = data.columns.levels[0].tolist()
     
     spy_ma = spy['Close'].rolling(CONFIG['MARKET_FILTER_MA']).mean().iloc[-1]
     if spy['Close'].iloc[-1] < spy_ma:
         st.warning("🛑 大盤紅燈 (SPY < MA50)，策略建議下週空手。")
         return pd.DataFrame()
 
-    for ticker in tickers:
+    # 批次下載最新數據
+    for i in range(0, len(tickers), BATCH_SIZE * 2): # 加大批次因為只需下載少數據
+        chunk = tickers[i:i + BATCH_SIZE * 2]
         try:
-            df = data[ticker].dropna()
-            if df.empty: continue
-            curr = df.iloc[-1]
+            data = yf.download(chunk, period="3mo", group_by='ticker', auto_adjust=False, threads=True, progress=False)
+            if data.empty: continue
             
-            close, volume = curr['Close'], curr['Volume']
-            if not (CONFIG['MIN_PRICE'] <= close <= CONFIG['MAX_PRICE']): continue
-            if volume <= CONFIG['MIN_VOLUME']: continue
-            if close <= df['Close'].rolling(60).mean().iloc[-1]: continue
+            # 清理
+            if len(chunk) == 1 and isinstance(data.columns, pd.Index): # 單檔處理
+                 pass # 保持原樣
+            else:
+                 data = data.dropna(axis=1, how='all')
+
+            current_tickers = data.columns.levels[0].tolist() if isinstance(data.columns, pd.MultiIndex) else chunk
+
+            for ticker in current_tickers:
+                try:
+                    df = data[ticker].dropna() if isinstance(data.columns, pd.MultiIndex) else data.dropna()
+                    if df.empty: continue
+                    curr = df.iloc[-1]
+                    
+                    # 簡易邏輯判斷
+                    close, volume = curr['Close'], curr['Volume']
+                    if not (CONFIG['MIN_PRICE'] <= close <= CONFIG['MAX_PRICE']): continue
+                    if volume <= CONFIG['MIN_VOLUME']: continue
+                    
+                    # RVol & Momentum
+                    vol_ma20 = df['Volume'].rolling(20).mean().iloc[-1]
+                    rvol = volume / vol_ma20 if vol_ma20 > 0 else 0
+                    if rvol <= CONFIG['MIN_RVOL']: continue
+                    
+                    mom = (close - df['Close'].shift(20).iloc[-1]) / df['Close'].shift(20).iloc[-1]
+                    if not (CONFIG['MIN_MOMENTUM'] <= mom <= CONFIG['MAX_MOMENTUM']): continue
+                    
+                    candidates.append({
+                        'Ticker': ticker, 'Close': close, 'RVol': round(rvol, 2),
+                        'Momentum': round(mom*100, 2)
+                    })
+                except: continue
             
-            vol_ma20 = df['Volume'].rolling(20).mean().iloc[-1]
-            rvol = volume / vol_ma20 if vol_ma20 > 0 else 0
-            if rvol <= CONFIG['MIN_RVOL']: continue
+            del data
+            gc.collect() # 強制清理
             
-            mom = (close - df['Close'].shift(20).iloc[-1]) / df['Close'].shift(20).iloc[-1]
-            if not (CONFIG['MIN_MOMENTUM'] <= mom <= CONFIG['MAX_MOMENTUM']): continue
-            
-            delta = df['Close'].diff()
-            rs = (delta.where(delta > 0, 0)).rolling(14).mean().iloc[-1] / (-delta.where(delta < 0, 0)).rolling(14).mean().iloc[-1]
-            rsi = 100 - (100 / (1 + rs))
-            if rsi <= CONFIG['MIN_RSI']: continue
-            
-            typical = (curr['High'] + curr['Low'] + close) / 3
-            rng = curr['High'] - curr['Low']
-            loc = (close - curr['Low']) / rng if rng > 0 else 0.5
-            
-            if close <= curr['Open'] or close <= typical or loc <= CONFIG['STRONG_CLOSE_RATIO']: continue
-            
-            candidates.append({
-                'Ticker': ticker, 'Close': close, 'RVol': round(rvol, 2),
-                'RSI': round(rsi, 2), 'Momentum': round(mom*100, 2)
-            })
         except: continue
-        
+
     df_next = pd.DataFrame(candidates)
     if not df_next.empty:
         return df_next.sort_values(by='RVol', ascending=False).head(5)
@@ -295,49 +254,88 @@ def predict_next_week(data, spy):
 # ==========================================
 # 🚀 主頁面
 # ==========================================
-st.title("📈 V60 美股策略儀表板")
-st.caption(f"Universe: {'S&P 100 (Safe Mode)' if LIMIT_TOP_100 else 'S&P 500 (Full)'} | Period: {BACKTEST_PERIOD}")
+st.title("📈 V60 美股策略儀表板 (SP500 Pro)")
+st.caption(f"Mode: Batch Processing (Memory Safe) | Period: {BACKTEST_PERIOD}")
 
-if st.button("🚀 開始執行策略掃描"):
+if st.button("🚀 開始執行全市場掃描"):
     
-    # 0. 獲取股票清單
+    # 1. 準備 SPY (只需下載一次)
+    with st.spinner("📥 下載大盤數據中..."):
+        spy = yf.download("SPY", period=BACKTEST_PERIOD, progress=False, auto_adjust=False)
+        if isinstance(spy.columns, pd.MultiIndex): spy.columns = spy.columns.get_level_values(0)
+        spy_ma = spy['Close'].rolling(CONFIG['MARKET_FILTER_MA']).mean()
+        market_signal = (spy['Close'] > spy_ma).to_dict()
+    
+    # 2. 準備股票清單
     tickers = get_sp500_tickers()
-    st.info(f"📋 目標股票池：共 {len(tickers)} 檔")
+    st.info(f"📋 鎖定 S&P 500 共 {len(tickers)} 檔股票，準備進行「分批運算」。")
 
-    # 1. 獲取資料
-    data, spy = get_data(tickers)
-    st.success(f"資料下載完成！準備進行運算...")
-
-    # 2. 執行策略
-    df_history = run_strategy(data, spy)
+    # 3. 分批執行回測
+    all_results = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
     
-    # 3. 顯示歷史紀錄
-    st.subheader("📜 歷史回測紀錄")
-    if not df_history.empty:
+    total_batches = (len(tickers) // BATCH_SIZE) + 1
+    
+    for i in range(0, len(tickers), BATCH_SIZE):
+        chunk = tickers[i:i + BATCH_SIZE]
+        batch_num = (i // BATCH_SIZE) + 1
+        
+        status_text.text(f"🔄 正在處理第 {batch_num}/{total_batches} 批次 ({len(chunk)} 檔)...")
+        progress_bar.progress(i / len(tickers))
+        
+        try:
+            # A. 下載這 50 檔的 5 年數據
+            batch_data = yf.download(chunk, period=BACKTEST_PERIOD, group_by='ticker', auto_adjust=False, threads=True, progress=False)
+            if batch_data.empty: continue
+            
+            # B. 運算策略
+            batch_results = process_batch_strategy(batch_data, spy, market_signal)
+            all_results.extend(batch_results)
+            
+            # C. ⚠️ 關鍵：刪除變數並強制回收記憶體
+            del batch_data
+            del batch_results
+            gc.collect()
+            
+        except Exception as e:
+            st.error(f"批次 {batch_num} 失敗: {e}")
+            continue
+
+    progress_bar.progress(100)
+    status_text.success("✅ 全市場掃描完成！")
+
+    # 4. 彙整結果
+    if all_results:
+        df_all = pd.DataFrame(all_results)
+        # 篩選每週 Top 3
+        df_history = df_all.sort_values(by=['Buy_Date', 'RVol'], ascending=[True, False]) \
+                           .groupby('Buy_Date').head(CONFIG['HOLDING_COUNT']).reset_index(drop=True)
+        df_history = df_history.sort_values(by='Buy_Date', ascending=False)
+        
+        st.subheader("📜 5年歷史回測紀錄 (S&P 500)")
         st.dataframe(df_history)
         
-        # 簡易分析
         total_ret = df_history['Return_Pct'].sum()
         win_rate = (df_history['Profit'] > 0).mean() * 100
         st.metric("歷史總獲利 %", f"{total_ret:.2f}%", delta=f"勝率 {win_rate:.0f}%")
+        
+        # 上傳
+        if st.checkbox("📤 上傳歷史紀錄到 Google Sheet?"):
+            sheet = connect_to_gsheet()
+            if sheet: upload_dataframe(sheet, "V60_SP500_5Y", df_history)
     else:
-        st.warning("⚠️ 在這段期間內沒有觸發任何訊號。")
+        st.warning("⚠️ 無符合訊號。")
 
-    # 4. 預測下週
+    # 5. 預測下週
+    st.write("---")
     st.subheader("🔮 下週一潛在標的")
-    df_next = predict_next_week(data, spy)
-    
-    if not df_next.empty:
-        st.dataframe(df_next)
-    else:
-        st.info("🔍 目前沒有符合下週進場條件的標的。")
-
-    # 5. 上傳 Google Sheet
-    if st.checkbox("📤 上傳結果到 Google Sheet?"):
-        sheet = connect_to_gsheet()
-        if sheet:
-            if not df_history.empty: 
-                upload_dataframe(sheet, "V60_History_5Y", df_history)
-            
-            if not df_next.empty: 
-                upload_dataframe(sheet, "V60_Action_List", df_next)
+    with st.spinner("正在掃描最新數據..."):
+        df_next = predict_next_week(tickers, spy)
+        if not df_next.empty:
+            st.dataframe(df_next)
+            if st.checkbox("📤 上傳下週清單到 Google Sheet?"):
+                sheet = connect_to_gsheet()
+                if sheet: upload_dataframe(sheet, "V60_Next_Week", df_next)
+        else:
+            st.info("無符合標的。")
