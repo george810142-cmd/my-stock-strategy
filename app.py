@@ -7,7 +7,6 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import warnings
 from datetime import datetime, timedelta
-import json
 
 # 忽略 pandas 的 FutureWarning
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -15,14 +14,11 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 # ==========================================
 # ⚙️ 設定區
 # ==========================================
-# 注意：在雲端環境無法持久保存 pkl，建議縮短回測週期或每次重抓
-DATA_FILE = "market_data_full_universe.pkl" 
-SPY_FILE = "spy_data_10y.pkl"
 SHEET_NAME = 'AStock Overnight trading'
 
 CONFIG = {
     'MIN_PRICE': 2.0, 
-    'MAX_PRICE': 50.0,
+    'MAX_PRICE': 200.0, #稍微放寬上限以免錯過好股
     'MIN_VOLUME': 800000,
     'MARKET_FILTER_MA': 50, 
     'MARKET_FILTER': True,
@@ -39,9 +35,17 @@ CONFIG = {
     'HOLDING_DAYS': 5
 }
 
-# 定義股票池 (這裡建議列出你關注的清單，因為雲端重抓全部幾千檔會超時)
-# 範例只列出幾檔，你需要替換成你的完整清單，或改為下載 S&P500
-TARGET_TICKERS = ['AAPL', 'TSLA', 'AMD', 'NVDA', 'PLTR', 'MARA', 'F', 'SOFI'] 
+# 擴充觀察名單 (避免樣本太少跑不出訊號)
+TARGET_TICKERS = [
+    # 科技巨頭 & 高動能
+    'AAPL', 'TSLA', 'AMD', 'NVDA', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NFLX',
+    # 加密貨幣相關
+    'COIN', 'MSTR', 'MARA', 'RIOT', 'CLSK',
+    # 成長與投機
+    'PLTR', 'SOFI', 'UPST', 'AFRM', 'DKNG', 'HOOD', 'ROKU', 'SHOP', 'CVNA',
+    # 傳統與其他
+    'F', 'GM', 'UBER', 'PYPL', 'SQ', 'INTC'
+]
 
 # ==========================================
 # 1. Google Sheet 連線 (改用 Streamlit Secrets)
@@ -50,8 +54,13 @@ def connect_to_gsheet():
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         
+        # 檢查是否設定了 Secrets
+        if "gcp_service_account" not in st.secrets:
+            st.error("❌ 未偵測到 Secrets 設定，無法連線 Google Sheet。請在 Streamlit 後台設定。")
+            return None
+
         # 從 Streamlit Secrets 讀取憑證資訊
-        key_dict = st.secrets["gcp_service_account"]
+        key_dict = dict(st.secrets["gcp_service_account"])
         creds = ServiceAccountCredentials.from_json_keyfile_dict(key_dict, scope)
         
         client = gspread.authorize(creds)
@@ -77,31 +86,30 @@ def upload_dataframe(sheet, tab_name, df):
 # ==========================================
 # 2. 數據獲取 (雲端版：快取模式)
 # ==========================================
-@st.cache_data(ttl=3600*12) # 設定快取 12 小時，避免重複下載
+@st.cache_data(ttl=3600*4) # 快取 4 小時
 def get_data():
-    st.info("📥 正在下載最新市場數據 (雲端模式)...")
-    
-    # 1. 下載 SPY
-    spy = yf.download("SPY", period="2y", progress=False, auto_adjust=False)
-    if isinstance(spy.columns, pd.MultiIndex): spy.columns = spy.columns.get_level_values(0)
-    
-    # 2. 下載個股 (下載 1 年份供運算即可)
-    # 注意：如果你的股票池很大，yf.download 可能會花很久時間
-    tickers = TARGET_TICKERS 
-    
-    data = yf.download(tickers, period="1y", group_by='ticker', auto_adjust=False, threads=True)
-    
-    # 簡單清理
-    if not data.empty:
-         data = data.dropna(axis=1, how='all')
-    
-    return data, spy
+    with st.spinner('📥 正在從 Yahoo Finance 下載數據...'):
+        # 1. 下載 SPY
+        spy = yf.download("SPY", period="2y", progress=False, auto_adjust=False)
+        if isinstance(spy.columns, pd.MultiIndex): spy.columns = spy.columns.get_level_values(0)
+        
+        # 2. 下載個股
+        tickers = TARGET_TICKERS 
+        data = yf.download(tickers, period="1y", group_by='ticker', auto_adjust=False, threads=True)
+        
+        # 簡單清理
+        if not data.empty:
+             data = data.dropna(axis=1, how='all')
+        
+        return data, spy
 
 # ==========================================
-# 3. 策略邏輯 (保留原邏輯，改寫 print)
+# 3. 策略邏輯
 # ==========================================
 def run_strategy(data, spy):
-    st.text("🧠 執行 V60 策略運算中...")
+    status_text = st.empty()
+    status_text.text("🧠 執行 V60 策略運算中...")
+    
     spy_ma = spy['Close'].rolling(CONFIG['MARKET_FILTER_MA']).mean()
     market_signal = (spy['Close'] > spy_ma).to_dict()
 
@@ -114,7 +122,7 @@ def run_strategy(data, spy):
         progress_bar.progress((i + 1) / len(tickers))
         try:
             df = data[ticker].copy().dropna()
-            if len(df) < 60: continue # 數據太少跳過
+            if len(df) < 60: continue 
             if df.index.tz is not None: df.index = df.index.tz_localize(None)
 
             # --- 技術指標 ---
@@ -196,6 +204,9 @@ def run_strategy(data, spy):
                 })
 
         except Exception: continue
+    
+    status_text.empty()
+    progress_bar.empty()
         
     if not all_candidates: return pd.DataFrame()
     
@@ -206,7 +217,6 @@ def run_strategy(data, spy):
     return df_history.sort_values(by='Buy_Date', ascending=False)
 
 def predict_next_week(data, spy):
-    # 簡化版預測邏輯
     candidates = []
     tickers = data.columns.levels[0].tolist()
     
@@ -255,39 +265,55 @@ def predict_next_week(data, spy):
         
     df_next = pd.DataFrame(candidates)
     if not df_next.empty:
-        return df_next.sort_values(by='RVol', ascending=False).head(3)
+        return df_next.sort_values(by='RVol', ascending=False).head(5)
     return pd.DataFrame()
 
 # ==========================================
 # 🚀 主頁面
 # ==========================================
 st.title("📈 V60 美股策略儀表板")
+st.caption("Cloud Edition v1.1")
 
 if st.button("🚀 開始執行策略掃描"):
     
     # 1. 獲取資料
     data, spy = get_data()
-    st.success(f"資料獲取完成！包含 {len(data.columns.levels[0])} 檔股票。")
+    st.success(f"資料獲取完成！掃描範圍：{len(data.columns.levels[0])} 檔股票。")
 
     # 2. 執行策略
     df_history = run_strategy(data, spy)
     
-    # 顯示歷史紀錄
+    # 3. 顯示歷史紀錄 (加入防呆機制，避免 KeyError)
     st.subheader("📜 歷史回測紀錄")
-    st.dataframe(df_history)
-    st.metric("歷史總獲利 %", f"{df_history['Return_Pct'].sum():.2f}%")
+    if not df_history.empty:
+        st.dataframe(df_history)
+        
+        # 計算總獲利
+        total_ret = df_history['Return_Pct'].sum()
+        color = "normal" if total_ret >= 0 else "off"
+        st.metric("歷史總獲利 %", f"{total_ret:.2f}%", delta=f"{total_ret:.2f}%")
+    else:
+        st.warning("⚠️ 過去一年內，這些股票沒有觸發任何 V60 進場訊號。建議擴大觀察名單！")
 
-    # 3. 預測下週
+    # 4. 預測下週
     st.subheader("🔮 下週一潛在標的")
     df_next = predict_next_week(data, spy)
+    
     if not df_next.empty:
         st.dataframe(df_next)
     else:
-        st.write("無符合標的")
+        st.info("🔍 目前沒有符合下週進場條件的標的 (或大盤紅燈)。")
 
-    # 4. 上傳 Google Sheet
+    # 5. 上傳 Google Sheet
     if st.checkbox("📤 上傳結果到 Google Sheet?"):
         sheet = connect_to_gsheet()
         if sheet:
-            if not df_history.empty: upload_dataframe(sheet, "V60_Cloud_History", df_history)
-            if not df_next.empty: upload_dataframe(sheet, "V60_Cloud_Next", df_next)
+            if not df_history.empty: 
+                upload_dataframe(sheet, "V60_Cloud_History", df_history)
+            else:
+                st.write("歷史紀錄為空，跳過上傳。")
+            
+            if not df_next.empty: 
+                upload_dataframe(sheet, "V60_Cloud_Next", df_next)
+            else:
+                st.write("下週清單為空，跳過上傳。")
