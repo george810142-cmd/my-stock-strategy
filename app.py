@@ -21,10 +21,14 @@ SHEET_NAME = 'AStock Overnight trading'
 BATCH_SIZE = 50 
 BACKTEST_PERIOD = "5y" 
 
+# ⚠️ 全美股數量龐大，Streamlit Cloud 容易超時
+# 建議設定限制 (例如 3000 檔)，設為 None 則跑全部 (約 8000+ 檔，極高機率超時)
+MAX_TICKERS_LIMIT = 3000 
+
 CONFIG = {
     'MIN_PRICE': 2.0, 
     'MAX_PRICE': 1000.0,
-    'MIN_VOLUME': 800000,
+    'MIN_VOLUME': 800000, # 提高成交量門檻，過濾冷門股
     'MARKET_FILTER_MA': 50, 
     'MARKET_FILTER': True,
     'MIN_RVOL': 2.5, 
@@ -43,20 +47,40 @@ CONFIG = {
 FALLBACK_TICKERS = ['AAPL', 'NVDA', 'MSFT', 'AMZN', 'GOOGL', 'META', 'TSLA']
 
 # ==========================================
-# 1. 基礎函數 (Get Tickers, GSheet, Upload)
+# 1. 取得全美股清單 (Nasdaq Traded)
 # ==========================================
 @st.cache_data(ttl=3600*24)
-def get_sp500_tickers():
+def get_all_us_tickers():
     try:
-        url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv"
-        response = requests.get(url)
-        if response.status_code == 200:
-            df = pd.read_csv(io.StringIO(response.text))
-            tickers = df['Symbol'].tolist()
-            clean_tickers = [t.replace('.', '-') for t in tickers]
-            return clean_tickers
+        # 從 Nasdaq 交易所下載最新交易清單
+        url = "http://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqtraded.txt"
+        df = pd.read_csv(url, sep='|')
+        
+        # 1. 過濾掉測試資料
+        df = df[df['Test Issue'] == 'N']
+        
+        # 2. 過濾掉 ETF (如果資料源有提供，若無則依賴代號判斷)
+        if 'ETF' in df.columns:
+            df = df[df['ETF'] == 'N']
+            
+        tickers = df['Symbol'].tolist()
+        
+        # 3. 排除特殊符號 (Warrants, Rights, Preferred 等通常帶有特殊後綴)
+        # 只保留純字母的代號，且長度 <= 4 (通常是正規股票)
+        # 雖然有些好股票是 5 個字母，但為了效能先排除雜訊
+        clean_tickers = [t for t in tickers if t.isalpha() and len(t) <= 5]
+        
+        # 隨機打亂順序，避免每次都只跑 A 開頭的股票
+        import random
+        random.shuffle(clean_tickers)
+        
+        if MAX_TICKERS_LIMIT:
+            return clean_tickers[:MAX_TICKERS_LIMIT]
+            
+        return clean_tickers
+    except Exception as e:
+        st.error(f"下載全美股清單失敗: {e}")
         return FALLBACK_TICKERS
-    except: return FALLBACK_TICKERS
 
 def connect_to_gsheet():
     try:
@@ -95,9 +119,18 @@ def process_batch_strategy(data, spy, market_signal):
     for ticker in tickers:
         try:
             df = data[ticker].copy().dropna()
-            if len(df) < 60: continue 
+            # 提高數據門檻：數據太少直接跳過
+            if len(df) < 100: continue 
             if df.index.tz is not None: df.index = df.index.tz_localize(None)
 
+            # 先檢查價格與成交量 (最快過濾法)
+            curr_price = df['Close'].iloc[-1]
+            curr_vol = df['Volume'].iloc[-1]
+            
+            if not (CONFIG['MIN_PRICE'] <= curr_price <= CONFIG['MAX_PRICE']): continue
+            if curr_vol < CONFIG['MIN_VOLUME']: continue
+
+            # --- 技術指標 ---
             df['MA60'] = df['Close'].rolling(60).mean()
             df['VolMA20'] = df['Volume'].rolling(20).mean().replace(0, 1)
             df['RVol'] = df['Volume'] / df['VolMA20']
@@ -115,6 +148,7 @@ def process_batch_strategy(data, spy, market_signal):
             df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
             df['Weekday'] = df.index.dayofweek
 
+            # --- 篩選條件 ---
             condition = (
                 (df['Weekday'] == 0) & 
                 (df['Close'] >= CONFIG['MIN_PRICE']) & (df['Close'] <= CONFIG['MAX_PRICE']) & 
@@ -127,6 +161,7 @@ def process_batch_strategy(data, spy, market_signal):
                 (df['Close_Loc'] > CONFIG['STRONG_CLOSE_RATIO']) & 
                 (df['Close'] > df['Typical_Price'])
             )
+            
             dates = df.index[condition]
             
             for date in dates:
@@ -170,8 +205,16 @@ def predict_next_week(tickers, spy):
     if spy['Close'].iloc[-1] < spy_ma:
         return pd.DataFrame()
 
-    for i in range(0, len(tickers), BATCH_SIZE * 2):
-        chunk = tickers[i:i + BATCH_SIZE * 2]
+    # 針對全市場，我們可以稍微放寬預測的批次處理，或是只針對已經過濾出高動能的清單
+    # 這裡為了效能，我們只下載最近 3 個月數據
+    total_scan = len(tickers)
+    # 進度顯示
+    scan_bar = st.progress(0)
+    
+    for i in range(0, total_scan, BATCH_SIZE * 5): # 加大批次加速掃描
+        chunk = tickers[i:i + BATCH_SIZE * 5]
+        scan_bar.progress(min(i / total_scan, 1.0))
+        
         try:
             data = yf.download(chunk, period="3mo", group_by='ticker', auto_adjust=False, threads=True, progress=False)
             if data.empty: continue
@@ -183,54 +226,57 @@ def predict_next_week(tickers, spy):
                     df = data[ticker].dropna() if isinstance(data.columns, pd.MultiIndex) else data.dropna()
                     if df.empty: continue
                     curr = df.iloc[-1]
-                    close, volume = curr['Close'], curr['Volume']
-                    if not (CONFIG['MIN_PRICE'] <= close <= CONFIG['MAX_PRICE']): continue
-                    if volume <= CONFIG['MIN_VOLUME']: continue
+                    
+                    # 快速過濾
+                    if curr['Volume'] < CONFIG['MIN_VOLUME']: continue
+                    if not (CONFIG['MIN_PRICE'] <= curr['Close'] <= CONFIG['MAX_PRICE']): continue
                     
                     vol_ma20 = df['Volume'].rolling(20).mean().iloc[-1]
-                    rvol = volume / vol_ma20 if vol_ma20 > 0 else 0
+                    rvol = curr['Volume'] / vol_ma20 if vol_ma20 > 0 else 0
                     if rvol <= CONFIG['MIN_RVOL']: continue
                     
-                    mom = (close - df['Close'].shift(20).iloc[-1]) / df['Close'].shift(20).iloc[-1]
+                    mom = (curr['Close'] - df['Close'].shift(20).iloc[-1]) / df['Close'].shift(20).iloc[-1]
                     if not (CONFIG['MIN_MOMENTUM'] <= mom <= CONFIG['MAX_MOMENTUM']): continue
                     
                     candidates.append({
-                        'Ticker': ticker, 'Close': close, 'RVol': round(rvol, 2),
-                        'Momentum': round(mom*100, 2)
+                        'Ticker': ticker, 'Close': round(curr['Close'], 2), 
+                        'RVol': round(rvol, 2), 'Momentum': round(mom*100, 2)
                     })
                 except: continue
             del data
             gc.collect()
         except: continue
-
+        
+    scan_bar.empty()
     df_next = pd.DataFrame(candidates)
     if not df_next.empty:
-        return df_next.sort_values(by='RVol', ascending=False).head(5)
+        return df_next.sort_values(by='RVol', ascending=False).head(10) # 取前 10 名
     return pd.DataFrame()
 
 # ==========================================
-# 🚀 主頁面 (邏輯修改重點區)
+# 🚀 主頁面
 # ==========================================
-st.title("📈 V60 美股策略儀表板 (SP500 Pro)")
-st.caption(f"Mode: Batch Processing | Period: {BACKTEST_PERIOD}")
+st.title("📈 V60 美股策略 (全美股版)")
+limit_text = f"Top {MAX_TICKERS_LIMIT} Random Stocks" if MAX_TICKERS_LIMIT else "All Market (~8000+)"
+st.caption(f"Universe: {limit_text} | Period: {BACKTEST_PERIOD}")
 
-# 1. 初始化 Session State (讓資料可以跨越 Rerun 存活)
-if 'df_history' not in st.session_state:
-    st.session_state['df_history'] = None
-if 'df_next' not in st.session_state:
-    st.session_state['df_next'] = None
+# Session State
+if 'df_history' not in st.session_state: st.session_state['df_history'] = None
+if 'df_next' not in st.session_state: st.session_state['df_next'] = None
 
-# 2. 只有按下按鈕時，才進行「運算」並更新 Session State
-if st.button("🚀 開始執行全市場掃描"):
+if st.button("🚀 開始全美股掃描"):
     
-    with st.spinner("📥 下載大盤數據中..."):
+    with st.spinner("📥 下載大盤數據..."):
         spy = yf.download("SPY", period=BACKTEST_PERIOD, progress=False, auto_adjust=False)
         if isinstance(spy.columns, pd.MultiIndex): spy.columns = spy.columns.get_level_values(0)
         spy_ma = spy['Close'].rolling(CONFIG['MARKET_FILTER_MA']).mean()
         market_signal = (spy['Close'] > spy_ma).to_dict()
     
-    tickers = get_sp500_tickers()
-    st.info(f"📋 鎖定 S&P 500 共 {len(tickers)} 檔股票...")
+    # 獲取全美股清單
+    with st.spinner("📥 從 Nasdaq 下載全美股清單..."):
+        tickers = get_all_us_tickers()
+    
+    st.info(f"📋 準備掃描 {len(tickers)} 檔股票 (已隨機排序)...")
 
     all_results = []
     progress_bar = st.progress(0)
@@ -240,8 +286,8 @@ if st.button("🚀 開始執行全市場掃描"):
     for i in range(0, len(tickers), BATCH_SIZE):
         chunk = tickers[i:i + BATCH_SIZE]
         batch_num = (i // BATCH_SIZE) + 1
-        status_text.text(f"🔄 處理中: 批次 {batch_num}/{total_batches}...")
-        progress_bar.progress(i / len(tickers))
+        status_text.text(f"🔄 批次 {batch_num}/{total_batches} ({len(all_results)} 筆訊號發現)...")
+        progress_bar.progress(min(i / len(tickers), 1.0))
         
         try:
             batch_data = yf.download(chunk, period=BACKTEST_PERIOD, group_by='ticker', auto_adjust=False, threads=True, progress=False)
@@ -253,9 +299,8 @@ if st.button("🚀 開始執行全市場掃描"):
         except: continue
 
     progress_bar.progress(100)
-    status_text.success("✅ 運算完成！")
+    status_text.success(f"✅ 掃描完成！共發現 {len(all_results)} 個訊號。")
 
-    # 彙整結果並存入 session_state
     if all_results:
         df_all = pd.DataFrame(all_results)
         df_hist = df_all.sort_values(by=['Buy_Date', 'RVol'], ascending=[True, False]) \
@@ -264,49 +309,34 @@ if st.button("🚀 開始執行全市場掃描"):
     else:
         st.session_state['df_history'] = pd.DataFrame()
 
-    # 下週預測並存入 session_state
-    with st.spinner("正在掃描下週標的..."):
+    with st.spinner("🔮 正在預測下週高潛力股 (全市場)..."):
         st.session_state['df_next'] = predict_next_week(tickers, spy)
 
 # ==========================================
-# 3. 顯示與上傳區 (獨立於按鈕之外)
+# 3. 顯示與上傳
 # ==========================================
-# 這裡會檢查 Session State 裡有沒有資料，如果有就顯示
-# 這樣就算你打勾觸發了 Rerun，資料也不會不見
-
 if st.session_state['df_history'] is not None:
-    
     df_history = st.session_state['df_history']
     df_next = st.session_state['df_next']
 
-    # --- 顯示歷史 ---
-    st.subheader("📜 5年歷史回測紀錄")
+    st.subheader("📜 歷史回測紀錄")
     if not df_history.empty:
         st.dataframe(df_history)
         total_ret = df_history['Return_Pct'].sum()
         win_rate = (df_history['Profit'] > 0).mean() * 100
         st.metric("歷史總獲利 %", f"{total_ret:.2f}%", delta=f"勝率 {win_rate:.0f}%")
     else:
-        st.warning("⚠️ 無歷史交易訊號。")
+        st.warning("⚠️ 無訊號發現。")
 
-    # --- 顯示下週 ---
     st.subheader("🔮 下週一潛在標的")
     if df_next is not None and not df_next.empty:
         st.dataframe(df_next)
     else:
         st.info("無符合標的。")
 
-    # --- 上傳按鈕 (改用 Button 比 Checkbox 更直覺) ---
     st.write("---")
     if st.button("📤 上傳結果到 Google Sheet"):
         sheet = connect_to_gsheet()
         if sheet:
-            if not df_history.empty: 
-                upload_dataframe(sheet, "V60_SP500_5Y", df_history)
-            else:
-                st.write("歷史紀錄為空，跳過上傳。")
-            
-            if df_next is not None and not df_next.empty: 
-                upload_dataframe(sheet, "V60_Next_Week", df_next)
-            else:
-                st.write("下週清單為空，跳過上傳。")
+            if not df_history.empty: upload_dataframe(sheet, "V60_AllUS_History", df_history)
+            if df_next is not None and not df_next.empty: upload_dataframe(sheet, "V60_AllUS_Next", df_next)
