@@ -90,7 +90,7 @@ def upload_dataframe(sheet, tab_name, df):
 def get_data():
     with st.spinner('📥 正在從 Yahoo Finance 下載數據...'):
         # 1. 下載 SPY
-        spy = yf.download("SPY", period="2y", progress=False, auto_adjust=False)
+        spy = yf.download("SPY", period="10y", progress=False, auto_adjust=False)
         if isinstance(spy.columns, pd.MultiIndex): spy.columns = spy.columns.get_level_values(0)
         
         # 2. 下載個股
@@ -317,3 +317,4 @@ if st.button("🚀 開始執行策略掃描"):
                 upload_dataframe(sheet, "V60_Cloud_Next", df_next)
             else:
                 st.write("下週清單為空，跳過上傳。")
+
